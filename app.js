@@ -100,18 +100,66 @@ function loadState() {
   }
 }
 
-let state = loadState();
-let saveTimer = null;
-function save(now = false) {
-  clearTimeout(saveTimer);
-  const doSave = () => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
-    catch (e) { toast('⚠️ Memoria piena: esporta un backup'); }
+// Il salvataggio funziona? (fallisce in navigazione privata o con "Blocca tutti i cookie")
+const storageOk = (() => {
+  try {
+    localStorage.setItem('__test', '1');
+    const ok = localStorage.getItem('__test') === '1';
+    localStorage.removeItem('__test');
+    return ok;
+  } catch (e) { return false; }
+})();
+const isStandalone = window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+
+// Copia di sicurezza dei dati in IndexedDB, usata se localStorage viene svuotato.
+const stateDB = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('diario-dati', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('dati');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const run = async (mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction('dati', mode);
+      const req = fn(t.objectStore('dati'));
+      t.oncomplete = () => res(req.result);
+      t.onerror = () => rej(t.error);
+    });
   };
-  if (now) doSave(); else saveTimer = setTimeout(doSave, 250);
+  return {
+    get: () => run('readonly', (st) => st.get('state')),
+    set: (json) => run('readwrite', (st) => st.put(json, 'state')),
+  };
+})();
+
+let state = loadState();
+let saveError = false;
+let mirrorTimer = null;
+// Salva subito a ogni modifica: su iPhone l'app può essere chiusa in qualsiasi momento.
+function save() {
+  state.savedAt = Date.now();
+  const json = JSON.stringify(state);
+  try {
+    localStorage.setItem(STORAGE_KEY, json);
+    if (saveError) { saveError = false; render(); }
+  } catch (e) {
+    if (!saveError) { saveError = true; toast('⚠️ Salvataggio non riuscito'); }
+  }
+  clearTimeout(mirrorTimer);
+  mirrorTimer = setTimeout(() => stateDB.set(json).catch(() => {}), 400);
 }
-window.addEventListener('pagehide', () => save(true));
-document.addEventListener('visibilitychange', () => { if (document.hidden) save(true); });
+const flush = () => {
+  save();
+  clearTimeout(mirrorTimer);
+  stateDB.set(JSON.stringify(state)).catch(() => {});
+};
+window.addEventListener('pagehide', flush);
+document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
+document.addEventListener('focusout', () => save());
 
 function day(k) {
   if (!state.days[k]) state.days[k] = { meals: {}, water: 0, cig: 0, drinks: 0, sleep: null };
@@ -363,12 +411,26 @@ function render() {
       <span class="ico">${t.ico}</span>${t.label}
     </button>`).join('');
   const main = $('#main');
-  if (ui.tab === 'cibo') main.innerHTML = renderCibo();
-  else if (ui.tab === 'allenamento') main.innerHTML = renderAllenamento();
-  else if (ui.tab === 'vita') main.innerHTML = renderVita();
-  else main.innerHTML = renderProgressi();
+  const warn = storageWarningHTML();
+  if (ui.tab === 'cibo') main.innerHTML = warn + renderCibo();
+  else if (ui.tab === 'allenamento') main.innerHTML = warn + renderAllenamento();
+  else if (ui.tab === 'vita') main.innerHTML = warn + renderVita();
+  else main.innerHTML = warn + renderProgressi();
   $$('textarea.meal').forEach(autosize);
   startElapsedTicker();
+}
+
+function storageWarningHTML() {
+  if (!storageOk || saveError) {
+    return `<div class="banner danger"><b>⚠️ I dati non vengono salvati.</b> Il telefono sta bloccando il salvataggio.<br>
+      Controlla: <b>Impostazioni → App → Safari</b> e disattiva <b>“Blocca tutti i cookie”</b>.
+      Non usare la navigazione privata. Poi chiudi e riapri l'app.</div>`;
+  }
+  if (isIOS && !isStandalone) {
+    return `<div class="banner warn"><b>Stai usando il Diario dentro Safari.</b> Per avere i dati sempre salvati apri l'app dall'icona sulla Home
+      (Condividi → Aggiungi alla schermata Home). I dati di Safari e quelli dell'icona sono separati.</div>`;
+  }
+  return '';
 }
 
 function dateNavHTML() {
@@ -577,7 +639,7 @@ function startWorkout(sessionId) {
       sets: Array.from({ length: plannedSets(ex) }, () => ({ kg: null, reps: null, done: false })),
     })),
   };
-  save(true);
+  save();
   render();
   window.scrollTo(0, 0);
 }
@@ -592,7 +654,7 @@ async function finishWorkout() {
   state.workouts.push(w);
   state.activeWorkout = null;
   stopRest();
-  save(true);
+  save();
   toast(`💪 Allenamento salvato (${doneSets} serie)`);
   render();
   window.scrollTo(0, 0);
@@ -765,6 +827,14 @@ function openSettings() {
       <button class="btn" style="flex:1" data-sheet="import">📂 Importa</button>
     </div>
 
+    <div class="section-title">Stato del salvataggio</div>
+    <div class="card" style="font-size:14px;display:grid;gap:4px">
+      <div>${storageOk && !saveError ? '✅ Salvataggio attivo' : '❌ Salvataggio bloccato dal telefono'}</div>
+      <div>${isStandalone ? '✅ Aperta dall\'icona sulla Home' : '⚠️ Aperta dentro il browser, non dall\'icona sulla Home'}</div>
+      <div class="muted">Ultimo salvataggio: ${state.savedAt ? new Date(state.savedAt).toLocaleString('it-IT', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'} ·
+        giorni registrati: ${Object.keys(state.days).length} · allenamenti: ${state.workouts.length}</div>
+    </div>
+
     <div class="section-title">Zona pericolosa</div>
     <button class="btn danger block" data-sheet="reset-program">Ripristina la scheda originale</button>
     <div style="height:8px"></div>
@@ -775,7 +845,7 @@ function openSettings() {
       const ph = e.target.closest('[data-set-phase]');
       if (ph) {
         const p = Number(ph.dataset.setPhase);
-        if (p !== st.phase) { st.phase = p; st.phaseStart = dateKey(); save(true); render(); openSettings(); }
+        if (p !== st.phase) { st.phase = p; st.phaseStart = dateKey(); save(); render(); openSettings(); }
         return;
       }
       const b = e.target.closest('[data-sheet]');
@@ -784,10 +854,10 @@ function openSettings() {
       if (a === 'export') exportBackup();
       if (a === 'import') importBackup();
       if (a === 'reset-program' && await ask('Ripristinare la scheda originale? Lo storico degli allenamenti resta.', { ok: 'Ripristina', danger: true })) {
-        state.program = structuredClone(DEFAULT_PROGRAM); save(true); closeSheet(); render(); toast('Scheda ripristinata');
+        state.program = structuredClone(DEFAULT_PROGRAM); save(); closeSheet(); render(); toast('Scheda ripristinata');
       }
       if (a === 'wipe' && await ask('Cancellare TUTTI i dati? Operazione irreversibile.', { ok: 'Continua', danger: true }) && await ask('Sei sicuro? Esporta prima un backup se ti serve.', { ok: 'Cancella tutto', danger: true })) {
-        state = defaultState(); save(true); await photoDB.clear(); for (const k in photoCache) delete photoCache[k];
+        state = defaultState(); save(); await photoDB.clear(); for (const k in photoCache) delete photoCache[k];
         closeSheet(); render(); toast('Dati cancellati');
       }
     });
@@ -858,7 +928,7 @@ function openProgramEditor() {
         if (!name) return;
         s.exercises.push({ id: `ex-${uid()}`, name: name.trim(), sets: 3, reps: '10', rest: 'medium', img: null });
       }
-      save(true);
+      save();
       refresh();
       render();
     });
@@ -890,7 +960,7 @@ async function exportBackup() {
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   }
   state.settings.lastBackup = dateKey();
-  save(true);
+  save();
   toast('💾 Backup esportato');
   render();
 }
@@ -907,7 +977,7 @@ function importBackup() {
       if (data.app !== 'diario-del-giorno' || !data.state) throw new Error('formato');
       if (!(await ask(`Importare il backup del ${new Date(data.exportedAt).toLocaleDateString('it-IT')}? I dati attuali verranno sostituiti.`, { ok: 'Importa' }))) return;
       state = { ...defaultState(), ...data.state };
-      save(true);
+      save();
       await photoDB.clear();
       for (const k in photoCache) delete photoCache[k];
       for (const [k, v] of Object.entries(data.photos || {})) { await photoDB.set(k, v); photoCache[k] = v; }
@@ -1005,12 +1075,12 @@ document.addEventListener('click', async (e) => {
       if (kg == null || kg < 20 || kg > 400) { toast('Inserisci un peso valido'); break; }
       state.weights = state.weights.filter((w) => w.date !== ui.date);
       state.weights.push({ date: ui.date, kg });
-      save(true); toast('⚖️ Peso salvato'); render();
+      save(); toast('⚖️ Peso salvato'); render();
       break;
     }
     case 'del-weight':
       state.weights = state.weights.filter((w) => w.date !== ui.date);
-      save(true); render();
+      save(); render();
       break;
     case 'start':
       if (aw) { toast('Hai già un allenamento in corso'); break; }
@@ -1027,7 +1097,7 @@ document.addEventListener('click', async (e) => {
         if (s.reps == null && num(repIn.placeholder) != null) s.reps = num(repIn.placeholder);
       }
       s.done = !s.done;
-      save(true);
+      save();
       if (s.done) {
         const ex = findEx(we.exId);
         const isLast = we.sets.every((x) => x.done);
@@ -1042,13 +1112,13 @@ document.addEventListener('click', async (e) => {
       const we = aw.exercises[b.dataset.i];
       const last = we.sets[we.sets.length - 1];
       we.sets.push({ kg: last?.kg ?? null, reps: null, done: false });
-      save(true); { const y = window.scrollY; render(); window.scrollTo(0, y); }
+      save(); { const y = window.scrollY; render(); window.scrollTo(0, y); }
       break;
     }
     case 'rm-set': {
       const we = aw.exercises[b.dataset.i];
       if (we.sets.length > 1) we.sets.pop();
-      save(true); { const y = window.scrollY; render(); window.scrollTo(0, y); }
+      save(); { const y = window.scrollY; render(); window.scrollTo(0, y); }
       break;
     }
     case 'rest-now': {
@@ -1059,7 +1129,7 @@ document.addEventListener('click', async (e) => {
     }
     case 'cancel-workout':
       if (await ask('Annullare l\'allenamento in corso? I dati di questa sessione andranno persi.', { ok: 'Annulla allenamento', cancel: 'Continua', danger: true })) {
-        state.activeWorkout = null; stopRest(); save(true); render();
+        state.activeWorkout = null; stopRest(); save(); render();
       }
       break;
     case 'finish-workout': finishWorkout(); break;
@@ -1068,7 +1138,7 @@ document.addEventListener('click', async (e) => {
     case 'delete-workout':
       if (await ask('Eliminare questo allenamento dallo storico?', { ok: 'Elimina', danger: true })) {
         state.workouts = state.workouts.filter((w) => w.id !== b.dataset.w);
-        ui.workoutView = null; save(true); render();
+        ui.workoutView = null; save(); render();
       }
       break;
     case 'photo': changePhoto(b.dataset.ex); break;
@@ -1124,6 +1194,18 @@ document.addEventListener('visibilitychange', () => {
 /* ================= Avvio ================= */
 (async function init() {
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  // Se localStorage è vuoto ma esiste la copia di sicurezza, recupera i dati.
+  try {
+    const hasLocal = storageOk && localStorage.getItem(STORAGE_KEY);
+    if (!hasLocal) {
+      const copy = await stateDB.get();
+      if (copy) {
+        state = { ...defaultState(), ...JSON.parse(copy) };
+        save();
+        toast('✅ Dati recuperati');
+      }
+    }
+  } catch (e) { console.warn(e); }
   await loadPhotos();
   if (state.activeWorkout) ui.tab = 'allenamento';
   render();

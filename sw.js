@@ -1,5 +1,5 @@
 /* Service worker: rende l'app utilizzabile offline. Cambia VERSION a ogni aggiornamento. */
-const VERSION = 'diario-v1';
+const VERSION = 'diario-v2';
 const ASSETS = [
   './',
   './index.html',

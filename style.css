@@ -329,3 +329,8 @@ select.field {
 .dialog p { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.4; }
 .dialog-actions { display: flex; gap: 8px; }
 .dialog-actions .btn { flex: 1; }
+.banner.danger {
+  background: linear-gradient(135deg, rgba(255, 93, 93, 0.2), rgba(255, 93, 93, 0.06));
+  border-color: rgba(255, 93, 93, 0.45);
+}
+.banner.danger b { color: var(--red); }
